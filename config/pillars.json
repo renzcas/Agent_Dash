@@ -1,0 +1,10 @@
+{
+  "unified_engine": {
+    "mode": "http_poll",
+    "base_url": "http://localhost:8001",
+    "state_endpoint": "/api/unified/state",
+    "step_endpoint": "/api/unified/step",
+    "poll_interval_ms": 500
+  },
+  "cavesharp_ws": "ws://localhost:8181"
+}
