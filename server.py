@@ -5,24 +5,47 @@ import platform
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, Tuple
 
-import torch
 from fastapi import Body, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from transformers import AutoModel, AutoTokenizer
 
-from modules.complex_attention import (
-    build_complex_attention,
-    collapse_attention,
-    phase_entropy,
-)
 from modules.trace_utils import stream_trace
 from pulse import emit_pulse
 from routing.unified_bridge import UnifiedEngineBridge
 
+try:
+    import torch
+    from transformers import AutoModel, AutoTokenizer
+
+    from modules.complex_attention import (
+        build_complex_attention,
+        collapse_attention,
+        phase_entropy,
+    )
+
+    _ML_AVAILABLE = True
+    _ML_IMPORT_ERROR: Optional[str] = None
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+    model = AutoModel.from_pretrained("bert-base-uncased")
+    input_ids = tokenizer("The agent is thinking...", return_tensors="pt")["input_ids"]
+except Exception as ml_exc:
+    _ML_AVAILABLE = False
+    _ML_IMPORT_ERROR = str(ml_exc)
+    torch = None
+    AutoModel = None
+    AutoTokenizer = None
+    build_complex_attention = None
+    collapse_attention = None
+    phase_entropy = None
+    tokenizer = None
+    model = None
+    input_ids = None
+
 CONFIG_PATH = Path("config/pillars.json")
+SNAPSHOT_PATH = Path("snapshots.ndjson")
+
 DEFAULT_CONFIG: Dict[str, Any] = {
     "unified_engine": {
         "mode": "http_poll",
@@ -54,6 +77,82 @@ def load_pillars_config() -> Dict[str, Any]:
         return DEFAULT_CONFIG.copy()
 
 
+def _to_float(val: Any, default: float) -> float:
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_int(val: Any, default: int = 0) -> int:
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_snapshot_line(raw_line: str) -> Optional[Dict[str, Any]]:
+    line = raw_line.strip()
+    if not line:
+        return None
+    try:
+        data = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    agent_name = data.get("agentName") or data.get("name")
+    if not agent_name or not isinstance(agent_name, str):
+        return None
+
+    beliefs_raw = data.get("beliefs") if isinstance(data.get("beliefs"), dict) else {}
+    metrics_raw = data.get("metrics") if isinstance(data.get("metrics"), dict) else {}
+
+    threat = _to_float(beliefs_raw.get("threat", data.get("threat", 0.0)), 0.0)
+    calm = _to_float(beliefs_raw.get("calm", data.get("calm", 0.5)), 0.5)
+    resilience = _to_float(
+        metrics_raw.get("resilience", data.get("resilience", 0.5)), 0.5
+    )
+
+    return {
+        "agentName": agent_name,
+        "tick": _to_int(data.get("tick"), 0),
+        "beliefs": {
+            "threat": threat,
+            "calm": calm,
+        },
+        "metrics": {
+            "resilience": resilience,
+        },
+    }
+
+
+def load_latest_agents(filepath: Path = SNAPSHOT_PATH) -> Tuple[List[Dict[str, Any]], int]:
+    if not filepath.exists():
+        return [], 0
+
+    latest_by_agent: Dict[str, Dict[str, Any]] = {}
+    skipped_lines = 0
+
+    with filepath.open("r", encoding="utf-8") as f:
+        for raw_line in f:
+            if not raw_line.strip():
+                continue
+            parsed = parse_snapshot_line(raw_line)
+            if parsed is None:
+                skipped_lines += 1
+                continue
+
+            name = parsed["agentName"]
+            current = latest_by_agent.get(name)
+            if current is None or parsed["tick"] >= current["tick"]:
+                latest_by_agent[name] = parsed
+
+    return list(latest_by_agent.values()), skipped_lines
+
+
 pillars_config = load_pillars_config()
 unified_cfg = pillars_config.get("unified_engine", {})
 unified_base_url = (
@@ -66,10 +165,6 @@ engine_bridge = UnifiedEngineBridge(
     state_endpoint=unified_cfg.get("state_endpoint", "/api/unified/state"),
     step_endpoint=unified_cfg.get("step_endpoint", "/api/unified/step"),
 )
-
-tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-model = AutoModel.from_pretrained("bert-base-uncased")
-input_ids = tokenizer("The agent is thinking...", return_tensors="pt")["input_ids"]
 
 app = FastAPI(title="AgentDash Telemetry Server")
 
@@ -86,13 +181,12 @@ def get_metadata() -> Dict[str, Any]:
 
 
 async def event_stream(request: Request):
-    session_id = f"session_{int(time.time())}"  # Unique per stream
+    session_id = f"session_{int(time.time())}"
 
     while True:
         if await request.is_disconnected():
             break
 
-        # 1. Interpreter pulse
         interpreter_payload = json.dumps({
             "type": "interpreter_pulse",
             "data": get_metadata(),
@@ -101,7 +195,6 @@ async def event_stream(request: Request):
         yield f"data: {interpreter_payload}\n\n"
         await asyncio.sleep(2)
 
-        # 2. Live unified engine snapshot pulse
         try:
             snapshot = await engine_bridge.fetch_latest_snapshot()
             snapshot_payload = json.dumps({
@@ -119,7 +212,6 @@ async def event_stream(request: Request):
             })
             yield f"data: {status_payload}\n\n"
 
-        # 3. Agent pulses
         yield emit_pulse("Planner initialized", role="planner", stream_id=session_id)
         await asyncio.sleep(1)
         yield emit_pulse(
@@ -130,12 +222,21 @@ async def event_stream(request: Request):
         )
         await asyncio.sleep(1)
 
-        # 4. Token-level trace
         for token in ["The", "agent", "is", "thinking", "..."]:
             if await request.is_disconnected():
                 return
             yield stream_trace(token, role="planner", stream_id=session_id)
             await asyncio.sleep(0.5)
+
+
+@app.get("/agents")
+async def get_agents():
+    agents, skipped = load_latest_agents(SNAPSHOT_PATH)
+    return {
+        "count": len(agents),
+        "skipped_lines": skipped,
+        "agents": agents,
+    }
 
 
 @app.get("/api/pillars")
@@ -187,6 +288,25 @@ async def stream(request: Request):
 
 @app.get("/complex-attention")
 async def stream_complex_attention(request: Request):
+    if (
+        not _ML_AVAILABLE
+        or model is None
+        or tokenizer is None
+        or input_ids is None
+        or torch is None
+        or build_complex_attention is None
+        or collapse_attention is None
+        or phase_entropy is None
+    ):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "available": False,
+                "reason": "Optional ML packages (torch/transformers) not installed in active environment",
+                "detail": _ML_IMPORT_ERROR,
+            },
+        )
+
     outputs = model(input_ids, output_attentions=True)
     attention_tensor = torch.stack(outputs.attentions)
 
@@ -206,6 +326,5 @@ async def stream_complex_attention(request: Request):
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
-# Mount static files last so API and SSE routes always take precedence
 if os.path.isdir("static"):
     app.mount("/", StaticFiles(directory="static", html=True), name="static")
