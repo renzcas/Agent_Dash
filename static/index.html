@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AgentDash — Renzoverse Telemetry Cockpit</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --panel: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --green: #3fb950;
+      --orange: #d29922;
+      --red: #f85149;
+      --blue: #58a6ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 24px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, sans-serif;
+    }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 24px;
+    }
+    h1 { margin: 0; font-size: 1.4rem; }
+    .meta { color: var(--muted); font-size: 0.85rem; }
+    .controls { display: flex; gap: 10px; align-items: center; }
+    button {
+      background: #21262d;
+      color: var(--text);
+      border: 1px solid var(--border);
+      padding: 8px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button:hover { border-color: var(--blue); }
+    .section-title {
+      font-size: 0.95rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      margin: 0 0 12px 0;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+      gap: 16px;
+      margin-bottom: 28px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--green);
+      border-radius: 8px;
+      padding: 16px;
+    }
+    .card.threat-high { border-left-color: var(--red); }
+    .card.resilience-low { border-left-color: var(--orange); }
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      margin-bottom: 12px;
+    }
+    .agent-name { font-size: 1.1rem; font-weight: 700; }
+    .tick { color: var(--muted); font-size: 0.85rem; }
+    .row {
+      display: flex;
+      justify-content: space-between;
+      padding: 4px 0;
+      font-variant-numeric: tabular-nums;
+      font-size: 0.92rem;
+    }
+    .badge-red { color: var(--red); }
+    .badge-orange { color: var(--orange); }
+    .badge-green { color: var(--green); }
+    pre {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px;
+      overflow-x: auto;
+      font-size: 0.85rem;
+      color: var(--blue);
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>AgentDash Telemetry Cockpit</h1>
+      <div class="meta" id="status-line">Polling /agents every 1s...</div>
+    </div>
+    <div class="controls">
+      <button onclick="stepEngine()">Step Unified Engine (+0.1)</button>
+      <span class="meta" id="step-status"></span>
+    </div>
+  </header>
+
+  <h2 class="section-title">Live Agents (snapshots.ndjson)</h2>
+  <div class="grid" id="agents-grid"></div>
+
+  <h2 class="section-title">Pillar Configuration (/api/pillars)</h2>
+  <pre id="pillars-box">Loading...</pre>
+
+  <script>
+    function getStatusClass(threat, resilience) {
+      if (threat > 0.7) return 'threat-high';
+      if (resilience < 0.3) return 'resilience-low';
+      return '';
+    }
+
+    function renderAgents(agents) {
+      const grid = document.getElementById('agents-grid');
+      if (!agents || agents.length === 0) {
+        grid.innerHTML = '<div class="meta">No valid snapshots in snapshots.ndjson yet.</div>';
+        return;
+      }
+      grid.innerHTML = agents.map(a => {
+        const threat = Number(a.beliefs?.threat ?? 0);
+        const calm = Number(a.beliefs?.calm ?? 0);
+        const resilience = Number(a.metrics?.resilience ?? 0);
+        const cardClass = getStatusClass(threat, resilience);
+        const threatColor = threat > 0.7 ? 'badge-red' : 'badge-green';
+        const resColor = resilience < 0.3 ? 'badge-orange' : 'badge-green';
+        return `
+          <div class="card ${cardClass}">
+            <div class="card-header">
+              <span class="agent-name">${a.agentName}</span>
+              <span class="tick">Tick ${a.tick}</span>
+            </div>
+            <div class="row"><span>Threat</span><strong class="${threatColor}">${threat.toFixed(2)}</strong></div>
+            <div class="row"><span>Calm</span><strong>${calm.toFixed(2)}</strong></div>
+            <div class="row"><span>Resilience</span><strong class="${resColor}">${resilience.toFixed(2)}</strong></div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    async function loadAgents() {
+      try {
+        const res = await fetch('/agents');
+        const data = await res.json();
+        renderAgents(data.agents || []);
+        document.getElementById('status-line').textContent =
+          `Active agents: ${data.count} | Skipped lines: ${data.skipped_lines} | Updated: ${new Date().toLocaleTimeString()}`;
+      } catch (err) {
+        document.getElementById('status-line').textContent = 'Error polling /agents';
+      }
+    }
+
+    async function loadPillars() {
+      try {
+        const res = await fetch('/api/pillars');
+        const data = await res.json();
+        document.getElementById('pillars-box').textContent = JSON.stringify(data, null, 2);
+      } catch (err) {
+        document.getElementById('pillars-box').textContent = 'Failed to load /api/pillars';
+      }
+    }
+
+    async function stepEngine() {
+      const label = document.getElementById('step-status');
+      label.textContent = 'Stepping...';
+      try {
+        const res = await fetch('/api/unified/step', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ dt: 0.1 })
+        });
+        const data = await res.json();
+        label.textContent = res.ok ? 'Stepped OK' : `Offline (${res.status})`;
+      } catch (err) {
+        label.textContent = 'Engine unreachable';
+      }
+    }
+
+    loadPillars();
+    loadAgents();
+    setInterval(loadAgents, 1000);
+  </script>
+</body>
+</html>
